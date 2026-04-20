@@ -118,4 +118,11 @@ impl TunnelServer {
             client.borrow_mut().clean_expired_connections(selector);
         }
     }
+
+    pub fn log_stats(&self) {
+        info!(target: TAG, "Connected clients: {}", self.clients.len());
+        for client in &self.clients {
+            client.borrow().log_stats();
+        }
+    }
 }

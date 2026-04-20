@@ -26,6 +26,10 @@ public class Relay {
     private static final String TAG = Relay.class.getSimpleName();
 
     private static final int CLEANING_INTERVAL = 60 * 1000;
+    // Emit a periodic snapshot of per-client connection counts so that
+    // saturation (approaching the fd rlimit) is observable without enabling
+    // debug logs.
+    private static final int STATS_INTERVAL = 5 * 60 * 1000;
 
     private final int port;
 
@@ -41,16 +45,24 @@ public class Relay {
 
         Log.i(TAG, "Relay server started");
 
-        long nextCleaningDeadline = System.currentTimeMillis() + UDPConnection.IDLE_TIMEOUT;
+        long start = System.currentTimeMillis();
+        long nextCleaningDeadline = start + UDPConnection.IDLE_TIMEOUT;
+        long nextStatsDeadline = start + STATS_INTERVAL;
         while (true) {
-            long timeout = Math.max(0, nextCleaningDeadline - System.currentTimeMillis());
+            long now = System.currentTimeMillis();
+            long nextDeadline = Math.min(nextCleaningDeadline, nextStatsDeadline);
+            long timeout = Math.max(0, nextDeadline - now);
             selector.select(timeout);
             Set<SelectionKey> selectedKeys = selector.selectedKeys();
 
-            long now = System.currentTimeMillis();
+            now = System.currentTimeMillis();
             if (now >= nextCleaningDeadline || selectedKeys.isEmpty()) {
                 tunnelServer.cleanUp();
                 nextCleaningDeadline = now + CLEANING_INTERVAL;
+            }
+            if (now >= nextStatsDeadline) {
+                tunnelServer.logStats();
+                nextStatsDeadline = now + STATS_INTERVAL;
             }
 
             for (SelectionKey selectedKey : selectedKeys) {

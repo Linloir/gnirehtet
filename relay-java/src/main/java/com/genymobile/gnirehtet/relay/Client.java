@@ -220,4 +220,14 @@ public class Client {
     public void cleanExpiredConnections() {
         router.cleanExpiredConnections();
     }
+
+    public void logStats() {
+        int[] counts = router.protocolCounts();
+        Log.i(TAG, "Client #" + id + " active connections:"
+                + " total=" + router.activeCount()
+                + " tcp=" + counts[0]
+                + " udp=" + counts[1]
+                + " other=" + counts[2]
+                + " pending_sources=" + pendingPacketSources.size());
+    }
 }

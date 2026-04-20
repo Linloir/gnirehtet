@@ -16,6 +16,7 @@
 
 use log::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::rc::{Rc, Weak};
 
@@ -32,15 +33,17 @@ const TAG: &str = "Router";
 
 pub struct Router {
     client: Weak<RefCell<Client>>,
-    // there are typically only few connections per client, HashMap would be less efficient
-    connections: Vec<Rc<RefCell<dyn Connection>>>,
+    // HashMap for O(1) lookup. Under load a single client can accumulate thousands of flows,
+    // so the original "few connections per client" assumption (Vec + linear scan) becomes the
+    // hot path for every packet.
+    connections: HashMap<ConnectionId, Rc<RefCell<dyn Connection>>>,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
             client: Weak::new(),
-            connections: Vec::new(),
+            connections: HashMap::new(),
         }
     }
 
@@ -55,32 +58,7 @@ impl Router {
         client_channel: &mut ClientChannel,
         ipv4_packet: &Ipv4Packet,
     ) {
-        if ipv4_packet.is_valid() {
-            match self.connection(selector, ipv4_packet) {
-                Ok(index) => {
-                    let closed = {
-                        let connection_ref = &self.connections[index];
-                        let mut connection = connection_ref.borrow_mut();
-                        connection.send_to_network(selector, client_channel, ipv4_packet);
-                        if connection.is_closed() {
-                            debug!(
-                                target: TAG,
-                                "Removing connection from router: {}",
-                                connection.id()
-                            );
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if closed {
-                        // the connection is closed, remove it
-                        self.connections.swap_remove(index);
-                    }
-                }
-                Err(err) => error!(target: TAG, "Cannot create route, dropping packet: {}", err),
-            }
-        } else {
+        if !ipv4_packet.is_valid() {
             warn!(target: TAG, "Dropping invalid packet");
             if log_enabled!(target: TAG, Level::Trace) {
                 trace!(
@@ -89,28 +67,42 @@ impl Router {
                     binary::build_packet_string(ipv4_packet.raw())
                 );
             }
+            return;
         }
-    }
 
-    fn connection(
-        &mut self,
-        selector: &mut Selector,
-        ipv4_packet: &Ipv4Packet,
-    ) -> io::Result<usize> {
         let (ipv4_header_data, transport_header_data) = ipv4_packet.headers_data();
         let transport_header_data = transport_header_data.expect("No transport");
         let id = ConnectionId::from_headers(ipv4_header_data, transport_header_data);
-        let index = match self.find_index(&id) {
-            Some(index) => index,
-            None => {
-                let connection =
-                    Self::create_connection(selector, id, self.client.clone(), ipv4_packet)?;
-                let index = self.connections.len();
-                self.connections.push(connection);
-                index
-            }
+
+        let connection_rc = match self.connections.get(&id) {
+            Some(rc) => rc.clone(),
+            None => match Self::create_connection(selector, id.clone(), self.client.clone(), ipv4_packet) {
+                Ok(rc) => {
+                    self.connections.insert(id.clone(), rc.clone());
+                    rc
+                }
+                Err(err) => {
+                    error!(
+                        target: TAG,
+                        "Cannot create route, dropping packet: {} (active connections: {})",
+                        err,
+                        self.connections.len()
+                    );
+                    return;
+                }
+            },
         };
-        Ok(index)
+
+        let closed = {
+            let mut connection = connection_rc.borrow_mut();
+            connection.send_to_network(selector, client_channel, ipv4_packet);
+            connection.is_closed()
+        };
+
+        if closed {
+            debug!(target: TAG, "Removing connection from router: {}", id);
+            self.connections.remove(&id);
+        }
     }
 
     fn create_connection(
@@ -143,56 +135,59 @@ impl Router {
         }
     }
 
-    fn find_index(&self, id: &ConnectionId) -> Option<usize> {
-        self.connections
-            .iter()
-            .position(|connection| connection.borrow().id() == id)
-    }
-
     pub fn remove(&mut self, connection: &dyn Connection) {
-        let index = self
-            .connections
-            .iter()
-            .position(|item| {
-                // compare (thin) pointers to find the connection to remove
-                binary::ptr_data_eq(connection, item.as_ptr())
-            })
-            .expect("Removing an unknown connection");
-        debug!(
-            target: TAG,
-            "Self-removing connection from router: {}",
-            connection.id()
-        );
-        self.connections.swap_remove(index);
+        let id = connection.id().clone();
+        if self.connections.remove(&id).is_none() {
+            warn!(target: TAG, "Removing an unknown connection: {}", id);
+        } else {
+            debug!(target: TAG, "Self-removing connection from router: {}", id);
+        }
     }
 
     pub fn clear(&mut self, selector: &mut Selector) {
-        for connection in &mut self.connections {
+        for (_, connection) in self.connections.drain() {
             connection.borrow_mut().close(selector);
         }
-        self.connections.clear();
     }
 
     pub fn clean_expired_connections(&mut self, selector: &mut Selector) {
-        // remove the last items first, otherwise i might not be less than len() on swap_remove(i)
-        for i in (0..self.connections.len()).rev() {
-            let expired = {
-                let mut connection = self.connections[i].borrow_mut();
-                if connection.is_expired() {
-                    debug!(
-                        target: TAG,
-                        "Removing expired connection from router: {}",
-                        connection.id()
-                    );
-                    connection.close(selector);
-                    true
-                } else {
-                    false
-                }
-            };
-            if expired {
-                self.connections.swap_remove(i);
+        let mut expired_ids = Vec::new();
+        for (id, connection) in &self.connections {
+            if connection.borrow().is_expired() {
+                expired_ids.push(id.clone());
             }
         }
+        for id in &expired_ids {
+            if let Some(connection) = self.connections.remove(id) {
+                debug!(target: TAG, "Removing expired connection from router: {}", id);
+                connection.borrow_mut().close(selector);
+            }
+        }
+        if !expired_ids.is_empty() {
+            info!(
+                target: TAG,
+                "Expired connections cleaned: {} (active: {})",
+                expired_ids.len(),
+                self.connections.len()
+            );
+        }
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.connections.len()
+    }
+
+    pub fn protocol_counts(&self) -> (usize, usize, usize) {
+        let mut tcp = 0;
+        let mut udp = 0;
+        let mut other = 0;
+        for id in self.connections.keys() {
+            match id.protocol() {
+                Protocol::Tcp => tcp += 1,
+                Protocol::Udp => udp += 1,
+                Protocol::Other => other += 1,
+            }
+        }
+        (tcp, udp, other)
     }
 }

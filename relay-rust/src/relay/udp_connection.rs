@@ -103,13 +103,25 @@ impl UdpConnection {
     }
 
     fn on_ready(&mut self, selector: &mut Selector, event: Event) {
-        #[allow(clippy::match_wild_err_arm)]
         match self.process(selector, event) {
             Ok(_) => (),
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
                 cx_debug!(target: TAG, self.id, "Spurious event, ignoring")
             }
-            Err(_) => panic!("Unexpected unhandled error"),
+            Err(err) => {
+                // Do not panic: crashing the relay kills every other flow.
+                cx_error!(
+                    target: TAG,
+                    self.id,
+                    "Unexpected error in on_ready, closing connection: [{:?}] {}",
+                    err.kind(),
+                    err
+                );
+                if !self.closed {
+                    self.close(selector);
+                }
+                self.remove_from_router();
+            }
         }
     }
 

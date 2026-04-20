@@ -176,13 +176,25 @@ impl Client {
     }
 
     fn on_ready(&mut self, selector: &mut Selector, event: Event) {
-        #[allow(clippy::match_wild_err_arm)]
         match self.process(selector, event) {
             Ok(_) => (),
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
                 debug!(target: TAG, "Spurious event, ignoring")
             }
-            Err(_) => panic!("Unexpected unhandled error"),
+            Err(err) => {
+                // Do not panic: a client-level error should tear down this
+                // client tunnel only, not the whole relay process.
+                error!(
+                    target: TAG,
+                    "Unexpected error in on_ready, closing client #{}: [{:?}] {}",
+                    self.id,
+                    err.kind(),
+                    err
+                );
+                if !self.closed {
+                    self.close(selector);
+                }
+            }
         }
     }
 
@@ -331,15 +343,25 @@ impl Client {
                         .expect("Unexpected pending source with no packet");
                     self.send_to_client(selector, &ipv4_packet)
                 };
-                #[allow(clippy::match_wild_err_arm)]
                 match result {
                     Ok(_) => {
                         source.next(selector);
                         true
                     }
                     Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => false,
-                    Err(_) => {
-                        panic!("Cannot send packet to client for unknown reason");
+                    Err(err) => {
+                        // Do not panic: dropping a single pending packet is
+                        // recoverable; tearing down the whole relay is not.
+                        error!(
+                            target: TAG,
+                            "Cannot send pending packet to client #{}, dropping it: [{:?}] {}",
+                            self.id,
+                            err.kind(),
+                            err
+                        );
+                        // discard the pending packet from the source
+                        source.next(selector);
+                        true
                     }
                 }
             };
@@ -352,6 +374,20 @@ impl Client {
 
     pub fn clean_expired_connections(&mut self, selector: &mut Selector) {
         self.router.clean_expired_connections(selector);
+    }
+
+    pub fn log_stats(&self) {
+        let (tcp, udp, other) = self.router.protocol_counts();
+        info!(
+            target: TAG,
+            "Client #{} active connections: total={} tcp={} udp={} other={} pending_sources={}",
+            self.id,
+            self.router.active_count(),
+            tcp,
+            udp,
+            other,
+            self.pending_packet_sources.len(),
+        );
     }
 
     fn must_send_id(&self) -> bool {

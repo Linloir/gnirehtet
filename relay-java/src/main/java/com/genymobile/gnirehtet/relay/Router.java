@@ -18,8 +18,9 @@ package com.genymobile.gnirehtet.relay;
 
 import java.io.IOException;
 import java.nio.channels.Selector;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 public class Router {
 
@@ -28,8 +29,10 @@ public class Router {
     private final Client client;
     private final Selector selector;
 
-    // there are typically only few connections per client, HashMap would be less efficient
-    private final List<Connection> connections = new ArrayList<>();
+    // HashMap for O(1) lookup. Under load a single client can accumulate thousands of flows,
+    // so the original "few connections per client" assumption (List + linear scan) becomes the
+    // hot path for every packet. LinkedHashMap keeps iteration order stable for debugging.
+    private final Map<ConnectionId, Connection> connections = new LinkedHashMap<>();
 
     public Router(Client client, Selector selector) {
         this.client = client;
@@ -48,16 +51,16 @@ public class Router {
             Connection connection = getConnection(packet.getIpv4Header(), packet.getTransportHeader());
             connection.sendToNetwork(packet);
         } catch (IOException e) {
-            Log.e(TAG, "Cannot create connection, dropping packet", e);
+            Log.e(TAG, "Cannot create connection, dropping packet (active connections: " + connections.size() + ")", e);
         }
     }
 
     private Connection getConnection(IPv4Header ipv4Header, TransportHeader transportHeader) throws IOException {
         ConnectionId id = ConnectionId.from(ipv4Header, transportHeader);
-        Connection connection = find(id);
+        Connection connection = connections.get(id);
         if (connection == null) {
             connection = createConnection(id, ipv4Header, transportHeader);
-            connections.add(connection);
+            connections.put(id, connection);
         }
         return connection;
     }
@@ -73,36 +76,62 @@ public class Router {
         throw new UnsupportedOperationException("Unsupported protocol: " + protocol);
     }
 
-    private Connection find(ConnectionId id) {
-        for (Connection connection : connections) {
-            if (id.equals(connection.getId())) {
-                return connection;
-            }
-        }
-        return null;
-    }
-
     public void clear() {
-        for (Connection connection : connections) {
+        for (Connection connection : connections.values()) {
             connection.disconnect();
         }
         connections.clear();
     }
 
     public void remove(Connection connection) {
-        if (!connections.remove(connection)) {
+        if (connections.remove(connection.getId()) == null) {
             throw new AssertionError("Removed a connection unknown from the router");
         }
     }
 
     public void cleanExpiredConnections() {
-        for (int i = connections.size() - 1; i >= 0; --i) {
-            Connection connection = connections.get(i);
+        int before = connections.size();
+        int expired = 0;
+        Iterator<Map.Entry<ConnectionId, Connection>> it = connections.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<ConnectionId, Connection> entry = it.next();
+            Connection connection = entry.getValue();
             if (connection.isExpired()) {
                 Log.d(TAG, "Remove expired connection: " + connection.getId());
                 connection.disconnect();
-                connections.remove(i);
+                it.remove();
+                ++expired;
             }
         }
+        if (expired > 0) {
+            Log.i(TAG, "Expired connections cleaned: " + expired + " (active: " + connections.size() + ", was: " + before + ")");
+        }
+    }
+
+    public int activeCount() {
+        return connections.size();
+    }
+
+    /**
+     * @return counts in the order {tcp, udp, other}
+     */
+    public int[] protocolCounts() {
+        int tcp = 0;
+        int udp = 0;
+        int other = 0;
+        for (ConnectionId id : connections.keySet()) {
+            switch (id.getProtocol()) {
+                case TCP:
+                    ++tcp;
+                    break;
+                case UDP:
+                    ++udp;
+                    break;
+                default:
+                    ++other;
+                    break;
+            }
+        }
+        return new int[]{tcp, udp, other};
     }
 }

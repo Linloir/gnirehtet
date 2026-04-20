@@ -29,6 +29,9 @@ use super::udp_connection::IDLE_TIMEOUT_SECONDS;
 
 const TAG: &str = "Relay";
 const CLEANING_INTERVAL_SECONDS: i64 = 60;
+// Emit a periodic snapshot of per-client connection counts so that saturation
+// (approaching the fd rlimit) is observable without enabling debug logs.
+const STATS_INTERVAL_SECONDS: i64 = 5 * 60;
 
 pub struct Relay {
     port: u16,
@@ -52,11 +55,14 @@ impl Relay {
         tunnel_server: &Rc<RefCell<TunnelServer>>,
     ) -> io::Result<()> {
         let mut events = Events::with_capacity(1024);
+        let start = Local::now().timestamp();
         // no connection may expire before the UDP idle timeout delay
-        let mut next_cleaning_deadline = Local::now().timestamp() + IDLE_TIMEOUT_SECONDS as i64;
+        let mut next_cleaning_deadline = start + IDLE_TIMEOUT_SECONDS as i64;
+        let mut next_stats_deadline = start + STATS_INTERVAL_SECONDS;
         loop {
             retry_on_intr!({
-                let timeout_seconds = max(0, next_cleaning_deadline - Local::now().timestamp());
+                let next_deadline = max(next_cleaning_deadline, next_stats_deadline);
+                let timeout_seconds = max(0, next_deadline - Local::now().timestamp());
                 let timeout = Some(Duration::new(timeout_seconds as u64, 0));
                 selector.poll(&mut events, timeout)
             })?;
@@ -65,7 +71,12 @@ impl Relay {
             if now >= next_cleaning_deadline {
                 tunnel_server.borrow_mut().clean_up(selector);
                 next_cleaning_deadline = now + CLEANING_INTERVAL_SECONDS;
-            } else if events.is_empty() {
+            }
+            if now >= next_stats_deadline {
+                tunnel_server.borrow().log_stats();
+                next_stats_deadline = now + STATS_INTERVAL_SECONDS;
+            }
+            if events.is_empty() && now < next_cleaning_deadline && now < next_stats_deadline {
                 debug!(
                     target: TAG,
                     "Spurious wakeup: poll() returned without any event"

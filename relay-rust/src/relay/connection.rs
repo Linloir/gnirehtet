@@ -40,7 +40,7 @@ pub trait Connection {
     fn is_closed(&self) -> bool;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct ConnectionId {
     protocol: Protocol,
     source_ip: u32,
@@ -48,6 +48,26 @@ pub struct ConnectionId {
     destination_ip: u32,
     destination_port: u16,
     id_string: String,
+}
+
+impl PartialEq for ConnectionId {
+    fn eq(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.source_ip == other.source_ip
+            && self.source_port == other.source_port
+            && self.destination_ip == other.destination_ip
+            && self.destination_port == other.destination_port
+    }
+}
+
+impl std::hash::Hash for ConnectionId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.protocol.hash(state);
+        self.source_ip.hash(state);
+        self.source_port.hash(state);
+        self.destination_ip.hash(state);
+        self.destination_port.hash(state);
+    }
 }
 
 impl ConnectionId {

@@ -23,6 +23,7 @@ use std::cmp;
 use std::io;
 use std::num::Wrapping;
 use std::rc::{Rc, Weak};
+use std::time::Instant;
 
 use super::binary;
 use super::client::{Client, ClientChannel};
@@ -43,6 +44,13 @@ const MTU: u16 = 0x4000;
 // 20 bytes for IP headers, 20 bytes for TCP headers
 const MAX_PAYLOAD_LENGTH: u16 = MTU - 20 - 20 as u16;
 
+// A TCP flow with no traffic in either direction for this many seconds is
+// considered abandoned and reclaimed by the periodic cleaner. Without this
+// cap, stuck half-open connections (client app killed, carrier NAT silently
+// dropping, window permanently 0, etc.) accumulate forever and eventually
+// exhaust the process' fd limit.
+pub const IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
+
 pub struct TcpConnection {
     self_weak: Weak<RefCell<TcpConnection>>,
     id: ConnectionId,
@@ -55,6 +63,7 @@ pub struct TcpConnection {
     packet_for_client_length: Option<u16>,
     closed: bool,
     tcb: Tcb,
+    idle_since: Instant,
 }
 
 // Transport Control Block
@@ -176,6 +185,7 @@ impl TcpConnection {
             packet_for_client_length: None,
             closed: false,
             tcb: Tcb::new(),
+            idle_since: Instant::now(),
         }));
 
         {
@@ -207,18 +217,33 @@ impl TcpConnection {
     }
 
     fn on_ready(&mut self, selector: &mut Selector, event: Event) {
-        #[allow(clippy::match_wild_err_arm)]
         match self.process(selector, event) {
             Ok(_) => (),
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
                 cx_debug!(target: TAG, self.id, "Spurious event, ignoring")
             }
-            Err(_) => panic!("Unexpected unhandled error"),
+            Err(err) => {
+                // Do not panic: crashing the relay would kill every other
+                // active flow as collateral damage. Close this connection
+                // and let the router move on.
+                cx_error!(
+                    target: TAG,
+                    self.id,
+                    "Unexpected error in on_ready, closing connection: [{:?}] {}",
+                    err.kind(),
+                    err
+                );
+                if !self.closed {
+                    self.close(selector);
+                }
+                self.remove_from_router();
+            }
         }
     }
     // return Err(err) with err.kind() == io::ErrorKind::WouldBlock on spurious event
     fn process(&mut self, selector: &mut Selector, event: Event) -> io::Result<()> {
         if !self.closed {
+            self.touch();
             let ready = event.readiness();
             if ready.is_readable() || ready.is_writable() {
                 if ready.is_writable() {
@@ -768,6 +793,10 @@ impl TcpConnection {
     fn may_write(&self) -> bool {
         !self.client_to_network.is_empty()
     }
+
+    fn touch(&mut self) {
+        self.idle_since = Instant::now();
+    }
 }
 
 impl Connection for TcpConnection {
@@ -781,6 +810,7 @@ impl Connection for TcpConnection {
         client_channel: &mut ClientChannel,
         ipv4_packet: &Ipv4Packet,
     ) {
+        self.touch();
         self.handle_packet(selector, client_channel, ipv4_packet);
         if !self.closed {
             self.update_interests(selector);
@@ -804,8 +834,7 @@ impl Connection for TcpConnection {
     }
 
     fn is_expired(&self) -> bool {
-        // no external timeout expiration
-        false
+        self.idle_since.elapsed().as_secs() > IDLE_TIMEOUT_SECONDS
     }
 
     fn is_closed(&self) -> bool {

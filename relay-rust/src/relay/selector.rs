@@ -90,10 +90,17 @@ impl Selector {
     where
         E: Evented + ?Sized,
     {
-        self.poll.deregister(handle)?;
-        // remove them before next poll()
+        // Always mark the token for removal from the handler slab, even if
+        // `poll.deregister` fails. Otherwise the handler Rc would leak and
+        // keep the Connection alive, preventing the underlying socket fd from
+        // being closed through RAII.
+        //
+        // On Linux epoll, the kernel automatically removes closed fds from
+        // epoll sets, so the deregister failure is mostly cosmetic: what must
+        // never leak is the strong reference held by the handler closure.
+        let result = self.poll.deregister(handle);
         self.tokens_to_remove.push(token);
-        Ok(())
+        result
     }
 
     fn clean_removed_tokens(&mut self) {

@@ -31,6 +31,13 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     // 20 bytes for IP headers, 20 bytes for TCP headers
     private static final int MAX_PAYLOAD_SIZE = MTU - 20 - 20;
 
+    // A TCP flow with no traffic in either direction for this many millis is
+    // considered abandoned and reclaimed by the periodic cleaner. Without this
+    // cap, stuck half-open connections (client app killed, carrier NAT silently
+    // dropping, window permanently 0, etc.) accumulate forever and eventually
+    // exhaust the process' fd limit.
+    public static final long IDLE_TIMEOUT = 10 * 60 * 1000L;
+
     private static final Random RANDOM = new Random();
 
     /**
@@ -72,6 +79,8 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     private boolean finReceived;
     private int clientWindow;
 
+    private long idleSince;
+
     public TCPConnection(ConnectionId id, Client client, Selector selector, IPv4Header ipv4Header, TCPHeader tcpHeader) throws IOException {
         super(id, client);
 
@@ -82,7 +91,10 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         networkToClient.getResponseIPv4Header().swapSourceAndDestination();
         networkToClient.getResponseTransportHeader().swapSourceAndDestination();
 
+        touch();
+
         SelectionHandler selectionHandler = (selectionKey) -> {
+            touch();
             if (selectionKey.isValid() && selectionKey.isConnectable()) {
                 processConnect();
             }
@@ -99,6 +111,10 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         // set the initial value now so that they won't need to be updated
         interests = SelectionKey.OP_CONNECT;
         selectionKey = channel.register(selector, interests, selectionHandler);
+    }
+
+    private void touch() {
+        idleSince = System.currentTimeMillis();
     }
 
     @Override
@@ -180,8 +196,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public boolean isExpired() {
-        // no external timeout expiration
-        return false;
+        return System.currentTimeMillis() >= idleSince + IDLE_TIMEOUT;
     }
 
     private void updateHeaders(int flags) {
@@ -201,6 +216,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public void sendToNetwork(IPv4Packet packet) {
+        touch();
         handlePacket(packet);
         logd(TAG, "current ack=" + acknowledgementNumber);
         updateInterests();

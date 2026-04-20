@@ -55,4 +55,11 @@ public class TunnelServer {
             client.cleanExpiredConnections();
         }
     }
+
+    public void logStats() {
+        Log.i(TAG, "Connected clients: " + clients.size());
+        for (Client client : clients) {
+            client.logStats();
+        }
+    }
 }
