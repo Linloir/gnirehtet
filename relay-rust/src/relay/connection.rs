@@ -36,6 +36,14 @@ pub trait Connection {
         ipv4_packet: &Ipv4Packet,
     );
     fn close(&mut self, selector: &mut Selector);
+    /// Called by the reaper when the flow has been idle for too long.
+    /// Receives a ClientChannel so implementations can push a terminal
+    /// packet (e.g. TCP RST) back to the client without having to
+    /// re-borrow the Client -- which would panic, since the reaper is
+    /// already holding it mutably.
+    fn expire(&mut self, selector: &mut Selector, _client_channel: &mut ClientChannel) {
+        self.close(selector);
+    }
     fn is_expired(&self) -> bool;
     fn is_closed(&self) -> bool;
 }

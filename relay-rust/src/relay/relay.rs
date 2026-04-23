@@ -25,10 +25,12 @@ use std::time::Duration;
 
 use super::selector::Selector;
 use super::tunnel_server::TunnelServer;
-use super::udp_connection::IDLE_TIMEOUT_SECONDS;
 
 const TAG: &str = "Relay";
-const CLEANING_INTERVAL_SECONDS: i64 = 60;
+// Kept short so that SynSent / half-open reaps (see CONNECT_TIMEOUT_SECONDS in
+// tcp_connection.rs) translate into a timely RST back to the Android client.
+// Scan is O(n) in connection count and runs in microseconds for realistic n.
+const CLEANING_INTERVAL_SECONDS: i64 = 5;
 // Emit a periodic snapshot of per-client connection counts so that saturation
 // (approaching the fd rlimit) is observable without enabling debug logs.
 const STATS_INTERVAL_SECONDS: i64 = 5 * 60;
@@ -56,8 +58,7 @@ impl Relay {
     ) -> io::Result<()> {
         let mut events = Events::with_capacity(1024);
         let start = Local::now().timestamp();
-        // no connection may expire before the UDP idle timeout delay
-        let mut next_cleaning_deadline = start + IDLE_TIMEOUT_SECONDS as i64;
+        let mut next_cleaning_deadline = start + CLEANING_INTERVAL_SECONDS;
         let mut next_stats_deadline = start + STATS_INTERVAL_SECONDS;
         loop {
             retry_on_intr!({

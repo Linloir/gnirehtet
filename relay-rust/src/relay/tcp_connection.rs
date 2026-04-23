@@ -51,6 +51,15 @@ const MAX_PAYLOAD_LENGTH: u16 = MTU - 20 - 20 as u16;
 // exhaust the process' fd limit.
 pub const IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 
+// A flow whose backend connect() has not completed within this many seconds is
+// reclaimed much sooner than IDLE_TIMEOUT_SECONDS. Without this, the Android
+// client keeps retransmitting its SYN for ~2 minutes (Pi's tcp_syn_retries
+// default) whenever the destination IP is unroutable -- e.g. QQ's fallback
+// login IPs in reserved/filtered prefixes. When the reaper picks up such a
+// flow, close() synthesizes a RST back to the client so the app fails fast
+// and can try the next candidate.
+pub const CONNECT_TIMEOUT_SECONDS: u64 = 10;
+
 pub struct TcpConnection {
     self_weak: Weak<RefCell<TcpConnection>>,
     id: ConnectionId,
@@ -262,7 +271,18 @@ impl TcpConnection {
                 }
             } else {
                 cx_debug!(target: TAG, self.id, "received ready = {:?}", ready);
-                // error or hup
+                // error or hup. Only synthesize a RST toward the client for
+                // a still-handshaking flow (SynSent / SynReceived), which is
+                // the QQ fallback-IP case we need to unblock. For an
+                // already-established flow, preserve the original silent
+                // close -- an unexpected RST surfacing in the app can trip
+                // client-side "network unhealthy" heuristics, and the
+                // app-layer timeout will detect the drop on its own.
+                if self.tcb.state == TcpState::SynSent
+                    || self.tcb.state == TcpState::SynReceived
+                {
+                    self.send_empty_packet_to_client(selector, tcp_header::FLAG_RST);
+                }
                 self.close(selector);
             }
             if self.closed {
@@ -390,6 +410,23 @@ impl TcpConnection {
 
     fn process_connect(&mut self, selector: &mut Selector) {
         assert_eq!(self.tcb.state, TcpState::SynSent);
+        // mio signals writable on both connect success AND connect failure.
+        // Checking SO_ERROR distinguishes the two so we don't forge a SYN+ACK
+        // back to the client over a socket that is actually dead.
+        match self.stream.take_error() {
+            Ok(Some(err)) => {
+                cx_info!(target: TAG, self.id, "Backend connect failed: {}", err);
+                // Safe to re-borrow the Client here: process_connect is called
+                // from on_ready, before the reaper path that holds Client mut.
+                self.send_empty_packet_to_client(selector, tcp_header::FLAG_RST);
+                self.close(selector);
+                return;
+            }
+            Err(err) => {
+                cx_warn!(target: TAG, self.id, "take_error failed: {}", err);
+            }
+            Ok(None) => {}
+        }
         self.tcb.state = TcpState::SynReceived;
         cx_debug!(target: TAG, self.id, "State = {:?}", self.tcb.state);
         self.send_empty_packet_to_client(selector, tcp_header::FLAG_SYN | tcp_header::FLAG_ACK);
@@ -833,8 +870,36 @@ impl Connection for TcpConnection {
         // socket will be closed by RAII
     }
 
+    fn expire(&mut self, selector: &mut Selector, client_channel: &mut ClientChannel) {
+        // Called by the periodic reaper instead of close(). We only emit a
+        // RST for flows still in the handshake phase -- that is the QQ
+        // fallback-IP case we need to unblock. For a long-idle Established
+        // flow we fall back to the original silent close: the app would
+        // recover via its own keepalive, and forging a RST risks tripping
+        // client-side "network unhealthy" heuristics.
+        if !self.closed
+            && (self.tcb.state == TcpState::SynSent
+                || self.tcb.state == TcpState::SynReceived)
+        {
+            self.reply_empty_packet_to_client(
+                selector,
+                client_channel,
+                tcp_header::FLAG_RST,
+            );
+        }
+        self.close(selector);
+    }
+
     fn is_expired(&self) -> bool {
-        self.idle_since.elapsed().as_secs() > IDLE_TIMEOUT_SECONDS
+        let idle = self.idle_since.elapsed().as_secs();
+        match self.tcb.state {
+            // Backend connect not yet complete: reap quickly so the client
+            // gets a timely RST rather than waiting on its own SYN retries.
+            TcpState::Init | TcpState::SynSent | TcpState::SynReceived => {
+                idle > CONNECT_TIMEOUT_SECONDS
+            }
+            _ => idle > IDLE_TIMEOUT_SECONDS,
+        }
     }
 
     fn is_closed(&self) -> bool {

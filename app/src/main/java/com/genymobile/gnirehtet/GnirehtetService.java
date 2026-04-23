@@ -47,6 +47,19 @@ public class GnirehtetService extends VpnService {
     // magic value: higher (like 0x8000 or 0xffff) or lower (like 1500) values show poorer performances
     private static final int MTU = 0x4000;
 
+    // Packages that refuse to work through this VPN and must bypass it. Reason:
+    // Tencent's MSF (mobile QQ push) library refuses to flush its main-conn
+    // send queue when ConnectivityManager reports the active network as a
+    // VPN -- packets sit in sendQ with mWriteSocketTime=0 and time out,
+    // which manifests as "network failed" in QQ while every other app on the
+    // device works. Excluding these UIDs from the VPN lets their sockets
+    // route directly via the underlying WiFi/mobile interface, while the
+    // rest of the device keeps going through gnirehtet.
+    private static final String[] DISALLOWED_PACKAGES = {
+            "com.tencent.mobileqq",
+            "com.tencent.tim",
+    };
+
     private final Notifier notifier = new Notifier(this);
     private final Handler handler = new RelayTunnelConnectionStateHandler(this);
 
@@ -139,6 +152,16 @@ public class GnirehtetService extends VpnService {
         // so switch to synchronous I/O to avoid polling
         builder.setBlocking(true);
         builder.setMtu(MTU);
+
+        for (String pkg : DISALLOWED_PACKAGES) {
+            try {
+                builder.addDisallowedApplication(pkg);
+                Log.i(TAG, "Excluded from VPN: " + pkg);
+            } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+                // Package not installed -- nothing to exclude; not fatal.
+                Log.d(TAG, "Skipping excluded package (not installed): " + pkg);
+            }
+        }
 
         vpnInterface = builder.establish();
         if (vpnInterface == null) {

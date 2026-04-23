@@ -150,7 +150,11 @@ impl Router {
         }
     }
 
-    pub fn clean_expired_connections(&mut self, selector: &mut Selector) {
+    pub fn clean_expired_connections(
+        &mut self,
+        selector: &mut Selector,
+        client_channel: &mut ClientChannel,
+    ) {
         let mut expired_ids = Vec::new();
         for (id, connection) in &self.connections {
             if connection.borrow().is_expired() {
@@ -160,7 +164,7 @@ impl Router {
         for id in &expired_ids {
             if let Some(connection) = self.connections.remove(id) {
                 debug!(target: TAG, "Removing expired connection from router: {}", id);
-                connection.borrow_mut().close(selector);
+                connection.borrow_mut().expire(selector, client_channel);
             }
         }
         if !expired_ids.is_empty() {

@@ -373,7 +373,17 @@ impl Client {
     }
 
     pub fn clean_expired_connections(&mut self, selector: &mut Selector) {
-        self.router.clean_expired_connections(selector);
+        // Split fields so the router can expire connections while getting a
+        // ClientChannel to send any terminal packets -- without going through
+        // a second RefCell::borrow_mut on the Client (which would panic,
+        // since TunnelServer already holds us mutably to call this method).
+        let mut channel = ClientChannel::new(
+            &mut self.network_to_client,
+            &self.stream,
+            self.token,
+            &mut self.interests,
+        );
+        self.router.clean_expired_connections(selector, &mut channel);
     }
 
     pub fn log_stats(&self) {
