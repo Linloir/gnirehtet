@@ -65,6 +65,10 @@ public class GnirehtetService extends VpnService {
 
     private ParcelFileDescriptor vpnInterface = null;
     private Forwarder forwarder;
+    // Last successfully applied configuration, kept so the stall watchdog
+    // can rebuild the tunnel with the same parameters.
+    private VpnConfiguration currentConfig;
+    private StallWatchdog watchdog;
 
     public static void start(Context context, VpnConfiguration config) {
         Intent intent = new Intent(context, GnirehtetService.class);
@@ -118,7 +122,63 @@ public class GnirehtetService extends VpnService {
     private void startVpn(VpnConfiguration config) {
         notifier.start();
         if (setupVpn(config)) {
+            currentConfig = config;
+            startWatchdog();
             startForwarding();
+        }
+    }
+
+    private void startWatchdog() {
+        if (watchdog != null) {
+            return;
+        }
+        watchdog = new StallWatchdog(new StallWatchdog.StallListener() {
+            @Override
+            public void onStallDetected(final long inflightMs) {
+                // Recovery must run off the watcher thread so cooldown
+                // accounting is unaffected, and on a thread that is
+                // allowed to do VpnService teardown/rebuild.
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Log.w(TAG, "Rebuilding VPN after stall (" + inflightMs + "ms inflight)");
+                        rebuildVpn();
+                    }
+                });
+            }
+        });
+        watchdog.start();
+    }
+
+    /**
+     * Tear down the current tun fd and forwarder, then re-establish a
+     * fresh tun fd with the last known configuration. Used by the stall
+     * watchdog to recover from a wedged Android VpnService without
+     * stopping the service or notifier.
+     */
+    private void rebuildVpn() {
+        VpnConfiguration config = currentConfig;
+        if (config == null) {
+            return;
+        }
+        // Tear down (close vpnInterface unblocks the writer thread).
+        try {
+            if (forwarder != null) {
+                forwarder.stop();
+                forwarder = null;
+            }
+            if (vpnInterface != null) {
+                vpnInterface.close();
+                vpnInterface = null;
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "Cannot close VPN file descriptor during rebuild", e);
+        }
+        // Re-establish.
+        if (setupVpn(config)) {
+            startForwarding();
+        } else {
+            Log.e(TAG, "Failed to rebuild VPN after stall");
         }
     }
 
@@ -203,7 +263,8 @@ public class GnirehtetService extends VpnService {
     }
 
     private void startForwarding() {
-        forwarder = new Forwarder(this, vpnInterface.getFileDescriptor(), new RelayTunnelListener(handler));
+        forwarder = new Forwarder(this, vpnInterface.getFileDescriptor(),
+                new RelayTunnelListener(handler), watchdog);
         forwarder.forward();
     }
 
@@ -214,6 +275,11 @@ public class GnirehtetService extends VpnService {
         }
 
         notifier.stop();
+        if (watchdog != null) {
+            watchdog.stop();
+            watchdog = null;
+        }
+        currentConfig = null;
 
         try {
             forwarder.stop();

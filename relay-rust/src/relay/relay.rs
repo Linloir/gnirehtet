@@ -18,7 +18,7 @@ use chrono::Local;
 use log::*;
 use mio::Events;
 use std::cell::RefCell;
-use std::cmp::max;
+use std::cmp::{max, min};
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -62,7 +62,11 @@ impl Relay {
         let mut next_stats_deadline = start + STATS_INTERVAL_SECONDS;
         loop {
             retry_on_intr!({
-                let next_deadline = max(next_cleaning_deadline, next_stats_deadline);
+                // We want to wake at whichever deadline comes FIRST -- using
+                // max() here would let cleaning be deferred all the way to
+                // the next stats deadline (~5 min) during idle periods,
+                // which lets dead-flow accumulation outpace reclamation.
+                let next_deadline = min(next_cleaning_deadline, next_stats_deadline);
                 let timeout_seconds = max(0, next_deadline - Local::now().timestamp());
                 let timeout = Some(Duration::new(timeout_seconds as u64, 0));
                 selector.poll(&mut events, timeout)

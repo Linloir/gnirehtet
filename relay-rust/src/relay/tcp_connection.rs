@@ -73,6 +73,13 @@ pub struct TcpConnection {
     closed: bool,
     tcb: Tcb,
     idle_since: Instant,
+    // Wall time when this flow was first observed. Unlike idle_since this
+    // is never refreshed -- so the handshake watchdog cannot be defeated
+    // by the Android client retransmitting SYNs at sub-CONNECT_TIMEOUT
+    // intervals (every retransmit calls send_to_network -> touch(), which
+    // would otherwise reset idle_since and pin the flow in SynSent
+    // forever from the reaper's point of view).
+    created_at: Instant,
 }
 
 // Transport Control Block
@@ -195,6 +202,7 @@ impl TcpConnection {
             closed: false,
             tcb: Tcb::new(),
             idle_since: Instant::now(),
+            created_at: Instant::now(),
         }));
 
         {
@@ -891,14 +899,22 @@ impl Connection for TcpConnection {
     }
 
     fn is_expired(&self) -> bool {
-        let idle = self.idle_since.elapsed().as_secs();
         match self.tcb.state {
             // Backend connect not yet complete: reap quickly so the client
             // gets a timely RST rather than waiting on its own SYN retries.
+            // Use created_at, NOT idle_since: the Android client retransmits
+            // its SYN every 1-2s and each retransmit calls send_to_network
+            // which calls touch(). If we measured handshake timeout from
+            // idle_since we would never reach CONNECT_TIMEOUT_SECONDS for
+            // an unreachable destination as long as the client keeps
+            // retransmitting -- the flow would only get reaped after the
+            // client itself gives up (~63s with default tcp_syn_retries=6),
+            // and dead flows would accumulate to fd-exhaustion levels under
+            // sustained fallback-IP traffic from apps like QQ.
             TcpState::Init | TcpState::SynSent | TcpState::SynReceived => {
-                idle > CONNECT_TIMEOUT_SECONDS
+                self.created_at.elapsed().as_secs() > CONNECT_TIMEOUT_SECONDS
             }
-            _ => idle > IDLE_TIMEOUT_SECONDS,
+            _ => self.idle_since.elapsed().as_secs() > IDLE_TIMEOUT_SECONDS,
         }
     }
 

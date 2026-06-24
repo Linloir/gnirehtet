@@ -44,12 +44,19 @@ public class Forwarder {
 
     private final FileDescriptor vpnFileDescriptor;
     private final PersistentRelayTunnel tunnel;
+    private final StallWatchdog watchdog;
 
     private Future<?> deviceToTunnelFuture;
     private Future<?> tunnelToDeviceFuture;
 
     public Forwarder(VpnService vpnService, FileDescriptor vpnFileDescriptor, RelayTunnelListener listener) {
+        this(vpnService, vpnFileDescriptor, listener, null);
+    }
+
+    public Forwarder(VpnService vpnService, FileDescriptor vpnFileDescriptor,
+                     RelayTunnelListener listener, StallWatchdog watchdog) {
         this.vpnFileDescriptor = vpnFileDescriptor;
+        this.watchdog = watchdog;
         tunnel = new PersistentRelayTunnel(vpnService, listener);
     }
 
@@ -129,8 +136,18 @@ public class Forwarder {
                 break;
             }
             if (w > 0) {
-                // blocking write
-                packetOutputStream.write(buffer, 0, w);
+                // blocking write -- arm the watchdog around it so a tun fd
+                // stall can be detected and recovered from.
+                if (watchdog != null) {
+                    watchdog.noteWriteStart();
+                }
+                try {
+                    packetOutputStream.write(buffer, 0, w);
+                } finally {
+                    if (watchdog != null) {
+                        watchdog.noteWriteEnd();
+                    }
+                }
             } else {
                 Log.d(TAG, "Empty write");
             }

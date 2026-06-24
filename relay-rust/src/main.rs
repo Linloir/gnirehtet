@@ -34,7 +34,7 @@ use std::thread;
 use std::time::Duration;
 
 const TAG: &str = "Main";
-const REQUIRED_APK_VERSION_CODE: &str = "9";
+const REQUIRED_APK_VERSION_CODE: &str = "10";
 
 #[inline]
 fn get_adb_path() -> String {
@@ -47,11 +47,25 @@ fn get_adb_path() -> String {
 
 #[inline]
 fn get_apk_path() -> String {
-    if let Some(env_adb) = std::env::var_os("GNIREHTET_APK") {
-        env_adb.into_string().expect("invalid GNIREHTET_APK value")
-    } else {
-        "gnirehtet.apk".to_string()
+    if let Some(env_apk) = std::env::var_os("GNIREHTET_APK") {
+        return env_apk.into_string().expect("invalid GNIREHTET_APK value");
     }
+    // Resolve "gnirehtet.apk" next to the running binary. Every typical
+    // deployment ships the two files together in one bundle directory
+    // (e.g. /home/mfat/utils/gnirehtet/{gnirehtet,gnirehtet.apk}), so
+    // this is reliable. The fall-through to a bare relative path below
+    // would otherwise depend on the caller's cwd happening to be the
+    // bundle dir -- true when register.service spawns us, NOT true when
+    // an admin runs `gnirehtet reinstall` from any other directory.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let apk = dir.join("gnirehtet.apk");
+            if apk.is_file() {
+                return apk.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "gnirehtet.apk".to_string()
 }
 
 const COMMANDS: &[&dyn Command] = &[
